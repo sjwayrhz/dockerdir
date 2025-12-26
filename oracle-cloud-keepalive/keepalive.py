@@ -18,7 +18,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.end_headers()
             # 返回当前状态给 Uptime Kuma
-            response_text = f"Keepalive Running.\nMemory: {STATUS['memory']}\nCPU Target: 15%"
+            response_text = f"Keepalive Running.\nMemory: {STATUS['memory']}\nCPU Status: {STATUS['cpu']}"
             self.wfile.write(response_text.encode('utf-8'))
         else:
             self.send_error(404)
@@ -44,19 +44,39 @@ def run_keepalive():
     web_thread.daemon = True
     web_thread.start()
 
+    
+    # --- Configurable Parameters from Environment Variables ---
+    try:
+        cpu_target_env = int(os.environ.get('TARGET_CPU_PERCENT', '15'))
+        global_target = cpu_target_env / 100.0
+    except ValueError:
+         global_target = 0.15
+         cpu_target_env = 15
+
+    try:
+        # Default 150MB
+        memory_mb_env = int(os.environ.get('TARGET_MEMORY_MB', '150'))
+    except ValueError:
+        memory_mb_env = 150
+
+    STATUS['cpu'] = f"Running (Target: {cpu_target_env}%)"
+    STATUS['memory'] = f"Allocating ({memory_mb_env}MB)..."
+
+
     # --- 内存占用部分 ---
     try:
-        print("Allocating 150MB Memory...")
-        memory_hog = bytearray(150 * 1024 * 1024) 
+        print(f"Allocating {memory_mb_env}MB Memory...")
+        # 1 MB = 1024 * 1024 bytes
+        memory_hog = bytearray(memory_mb_env * 1024 * 1024) 
         memory_hog[0] = 1 
-        STATUS['memory'] = "Allocated (150MB)" # 更新状态
+        STATUS['memory'] = f"Allocated ({memory_mb_env}MB)" # 更新状态
         print("Memory Allocated Successfully.")
     except Exception as e:
         STATUS['memory'] = f"Failed: {e}"
         print(f"Memory Allocation Failed: {e}")
 
     # --- CPU 占用部分 ---
-    print("Starting CPU cycle (Target: 15%)...")
+    print(f"Starting CPU cycle (Target: {cpu_target_env}%)...")
     
     
     # --- 数学模型参数 ---
@@ -75,7 +95,7 @@ def run_keepalive():
     
     import math
     cycle_total = 0.1
-    global_target = 0.15
+    # global_target has been set above
     print(f"Smart Curve Mode: Cycle={cycle_total}s, Global Target={global_target*100}%")
     
     while True:
