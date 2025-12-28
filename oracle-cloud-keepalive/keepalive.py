@@ -39,22 +39,33 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 # --- 流量下载任务 (凌晨保活) ---
 def download_traffic_job():
-    # target_url = "https://officecdn.microsoft.com/db/492350f6-3a01-4f97-b9c0-c7c6ddf67d60/media/zh-cn/ProPlus2024Retail.img" # v1.3下载Office 2024 ISO 镜像
-    target_url = "https://speed.cloudflare.com/__down?bytes=5368709120"  # v1.4 下载cloudflare 5GB测试文件
-    rate_limit = "2.1M" 
+    # 104857600 Bytes = 100 MB
+    target_url = "https://speed.cloudflare.com/__down?bytes=104857600" 
+    rate_limit = "2.1M"
+    total_segments = 50  # 定义总段数，方便后续修改，bytes=10485760(100MB) * 50 = 5 GB
 
-    print(f"[{datetime.now()}] 🚀 启动凌晨流量保活任务 (Office 2024 ISO)...")
-    STATUS['traffic'] = f"Downloading at {rate_limit}..."
-
-    try:
-        # -O /dev/null 直接丢弃不占空间
-        cmd = ["wget", f"--limit-rate={rate_limit}", "-O", "/dev/null", target_url]
-        subprocess.run(cmd, check=True)
-        print(f"[{datetime.now()}] ✅ 任务完成。")
-        STATUS['traffic'] = "Last task completed successfully"
-    except Exception as e:
-        print(f"[{datetime.now()}] ❌ 任务失败: {e}")
-        STATUS['traffic'] = f"Failed: {e}"
+    print(f"[{datetime.now()}] 🚀 启动凌晨分段保活任务 (目标: {total_segments * 100 / 1024:.2f} GB)...")
+    
+    for i in range(total_segments): 
+        # 1. 更新状态，现在会显示正确的总进度 (例如: 1/50)
+        STATUS['traffic'] = f"Progress: {i+1}/{total_segments} downloading ({rate_limit})..."
+        
+        try:
+            # 2. 执行下载，--tries=3 增加健壮性
+            cmd = ["wget", f"--limit-rate={rate_limit}", "--tries=3", "-O", "/dev/null", target_url]
+            subprocess.run(cmd, check=True)
+            
+            # 3. 如果不是最后一段，则等待 5 秒，模拟真实流量间歇
+            if i < (total_segments - 1): 
+                time.sleep(5) 
+        except Exception as e:
+            print(f"[{datetime.now()}] 第 {i+1} 段下载异常: {e}")
+            # 发生错误时稍作休息，避免循环报错导致 CPU 飙升
+            time.sleep(10)
+            
+    # 4. 任务结束更新状态
+    STATUS['traffic'] = f"Completed {total_segments} segments at {datetime.now().strftime('%H:%M:%S')}"
+    print(f"[{datetime.now()}] ✅ 任务全部处理完毕。")
 
 # --- 定时器线程逻辑 ---
 def scheduler_loop():
