@@ -1,11 +1,8 @@
 # 0. 快速启动
-默认15%CPU，150MB内存
-```
-docker run -d -p 65080:65080 --name oracle-keepalive --restart always sjwayrhz/oracle-alive:v1.1
 ```
 自定义CPU和内存，例如15%CPU，100MB内存
 ```
-docker run --rm -p 65080:65080 -e TARGET_CPU_PERCENT=15 -e TARGET_MEMORY_MB=100 --name oracle-keepalive --restart always sjwayrhz/oracle-alive:v1.2
+docker run --rm -p 65080:65080 -e TARGET_CPU_PERCENT=15 -e TARGET_MEMORY_MB=100 --name oracle-keepalive --restart always sjwayrhz/oracle-alive:v1.3
 ```
 # 1. 构建镜像（命名为 oracle-alive）
 
