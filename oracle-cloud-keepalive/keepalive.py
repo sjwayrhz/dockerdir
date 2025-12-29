@@ -6,12 +6,14 @@ import subprocess
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# --- 全局变量用于状态监控 ---
+# --- 全局状态与锁 ---
 STATUS = {
     "memory": "Not Allocated",
     "cpu": "Running",
     "traffic": "Idle"
 }
+# 关键：线程锁，确保同一时间只有一个下载任务在运行
+traffic_lock = threading.Lock()
 
 # --- HTTP 处理类 (用于监控查看) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -21,14 +23,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.end_headers()
             
-            # 构建返回内容，增加了 Schedule 的展示
             response_text = (
-                f"Keepalive Running.\n"
-                f"Memory Status: {STATUS['memory']}\n"
-                f"CPU Status: {STATUS['cpu']}\n"
-                f"Traffic Status: {STATUS['traffic']}\n"
-                f"Schedule: Daily 00:00 - 05:00 (CST)\n"
-                f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"Oracle Cloud Keepalive Monitor\n"
+                f"----------------------------\n"
+                f"Memory Status  : {STATUS['memory']}\n"
+                f"CPU Status     : {STATUS['cpu']}\n"
+                f"Traffic Status : {STATUS['traffic']}\n"
+                f"Schedule       : Daily 00:00 - 05:00 (System Time)\n"
+                f"Current Time   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
             self.wfile.write(response_text.encode('utf-8'))
         else:
@@ -37,47 +39,55 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-# --- 流量下载任务 (凌晨保活) ---
+# --- 流量下载任务 (长周期保活逻辑) ---
 def download_traffic_job():
-    # 104857600 Bytes = 100 MB
-    target_url = "https://speed.cloudflare.com/__down?bytes=104857600" 
-    rate_limit = "2.1M"
-    total_segments = 50  # 定义总段数，方便后续修改，bytes=10485760(100MB) * 50 = 5 GB
+    # 1. 尝试获取锁，如果拿不到，说明上一个任务还在跑
+    if not traffic_lock.acquire(blocking=False):
+        print(f"[{datetime.now()}] ⚠️ 任务跳过：上一个周期的任务尚未结束，为防止流量叠加，本次不启动。")
+        return
 
-    print(f"[{datetime.now()}] 🚀 启动凌晨分段保活任务 (目标: {total_segments * 100 / 1024:.2f} GB)...")
-    
-    for i in range(total_segments): 
-        # 1. 更新状态，现在会显示正确的总进度 (例如: 1/50)
-        STATUS['traffic'] = f"Progress: {i+1}/{total_segments} downloading ({rate_limit})..."
+    try:
+        # 参数配置：1.3M Byte/s ≈ 10.4 Mbps (超过50M带宽的20%)
+        target_url = "https://speed.cloudflare.com/__down?bytes=104857600" # 100MB
+        rate_limit = "1.3M" 
+        total_segments = 32 # 32段 * 100MB ≈ 3.2GB，总时长约 40-45 分钟
+
+        print(f"[{datetime.now()}] 🚀 启动长周期保活任务 (限速: {rate_limit})...")
         
-        try:
-            # 2. 执行下载，--tries=3 增加健壮性
-            cmd = ["wget", f"--limit-rate={rate_limit}", "--tries=3", "-O", "/dev/null", target_url]
-            subprocess.run(cmd, check=True)
+        for i in range(total_segments): 
+            STATUS['traffic'] = f"Downloading: {i+1}/{total_segments} (@{rate_limit})"
             
-            # 3. 如果不是最后一段，则等待 5 秒，模拟真实流量间歇
-            if i < (total_segments - 1): 
-                time.sleep(5) 
-        except Exception as e:
-            print(f"[{datetime.now()}] 第 {i+1} 段下载异常: {e}")
-            # 发生错误时稍作休息，避免循环报错导致 CPU 飙升
-            time.sleep(10)
-            
-    # 4. 任务结束更新状态
-    STATUS['traffic'] = f"Completed {total_segments} segments at {datetime.now().strftime('%H:%M:%S')}"
-    print(f"[{datetime.now()}] ✅ 任务全部处理完毕。")
+            try:
+                # 使用 wget 进行限速下载，结果丢弃到 /dev/null
+                cmd = ["wget", f"--limit-rate={rate_limit}", "--tries=2", "-O", "/dev/null", target_url]
+                subprocess.run(cmd, check=True)
+                
+                # 每段下载完稍作休息
+                if i < (total_segments - 1):
+                    time.sleep(5)
+            except Exception as e:
+                print(f"[{datetime.now()}] 分段下载异常: {e}")
+                time.sleep(10)
+                
+    finally:
+        # 2. 无论成功失败，最终都要释放锁，允许下次任务进入
+        traffic_lock.release()
+        STATUS['traffic'] = f"Idle (Finished at {datetime.now().strftime('%H:%M:%S')})"
+        print(f"[{datetime.now()}] ✅ 本轮任务处理完毕。")
 
-# --- 定时器线程逻辑 ---
+# --- 定时器监控线程 ---
 def scheduler_loop():
-    print("⏰ 定时任务监控线程已启动 (目标: 00:00-04:59)")
+    print("⏰ 定时任务监控线程已启动 (目标时间段: 00:00-04:59)")
     while True:
         now = datetime.now()
-        # 凌晨 0, 1, 2, 3, 4 点的 00 分触发
+        # 每天 0, 1, 2, 3, 4 点的 00 分触发
         if now.hour in [0, 1, 2, 3, 4] and now.minute == 0:
-            download_traffic_job()
-            time.sleep(65) # 避开重复触发
+            # 异步启动下载任务，不阻塞时间判断
+            t = threading.Thread(target=download_traffic_job)
+            t.start()
+            time.sleep(65) # 避开当前分钟重复触发
 
-        time.sleep(30) # 每 30 秒核对一次时间
+        time.sleep(30)
 
 def start_web_server(port=65080):
     try:
@@ -100,7 +110,7 @@ def run_keepalive():
     traffic_thread.daemon = True
     traffic_thread.start()
 
-    # --- 获取环境变量参数 ---
+    # --- 获取 CPU 和 内存 参数 ---
     try:
         cpu_target_env = int(os.environ.get('TARGET_CPU_PERCENT', '15'))
         global_target = cpu_target_env / 100.0
@@ -115,53 +125,30 @@ def run_keepalive():
 
     STATUS['cpu'] = f"Running (Target: {cpu_target_env}%)"
 
-    # 3. 执行内存占用 (修复 0MB 报错逻辑)
+    # 3. 内存占用
     if memory_mb_env > 0:
         try:
             print(f"Allocating {memory_mb_env}MB Memory...")
             memory_hog = bytearray(memory_mb_env * 1024 * 1024)
-            if len(memory_hog) > 0:
-                memory_hog[0] = 1
+            if len(memory_hog) > 0: memory_hog[0] = 1
             STATUS['memory'] = f"Allocated ({memory_mb_env}MB)"
-            print("Memory Allocated Successfully.")
         except Exception as e:
             STATUS['memory'] = f"Failed: {e}"
-            print(f"Memory Allocation Failed: {e}")
     else:
-        STATUS['memory'] = "Disabled (0MB)"
-        print("Memory allocation skipped.")
+        STATUS['memory'] = "Disabled"
 
-    # 4. CPU 周期占用 (主循环)
+    # 4. CPU 周期占用主循环
     print(f"Starting CPU cycle (Target: {cpu_target_env}%)...")
-    import math
     cycle_total = 0.1
-    
     while True:
         cycle_start = time.time()
         active_load = 0.35 + 0.15 * math.sin(cycle_start)
         work_quantum = cycle_total * global_target
         active_duration = work_quantum / active_load
         
-        param_slice = 0.01
-        if active_duration < param_slice:
-             param_slice = active_duration
-             
-        elapsed_active = 0
-        while elapsed_active < active_duration:
-            slice_start = time.time()
-            current_slice_work = param_slice * active_load
-            current_slice_sleep = param_slice * (1 - active_load)
-            
-            t0 = time.time()
-            while time.time() - t0 < current_slice_work:
-                _ = 123 * 456
-                
-            if current_slice_sleep > 0.001:
-                time.sleep(current_slice_sleep)
-                
-            elapsed_active = time.time() - cycle_start
-            if elapsed_active >= active_duration:
-                break
+        t0 = time.time()
+        while time.time() - t0 < active_duration:
+            _ = 123 * 456
         
         elapsed_total = time.time() - cycle_start
         sleep_remainder = cycle_total - elapsed_total
